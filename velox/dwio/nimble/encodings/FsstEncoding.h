@@ -342,16 +342,40 @@ void FsstEncoding::readWithVisitor(V& visitor, ReadWithVisitorParams& params) {
   // Deterministic filter-only ranges do not need decoded strings.
   if constexpr (requires { typename V::FilterType; }) {
     if constexpr (
-        std::is_same_v<typename V::FilterType, velox::common::BytesRange> &&
+        (std::is_same_v<typename V::FilterType, velox::common::BytesRange> ||
+         std::is_same_v<
+             typename V::FilterType,
+             velox::common::NegatedBytesRange>) &&
         std::is_same_v<typename V::Extract, velox::dwio::common::DropValues>) {
-      if (visitor.filter().isDeterministic()) {
+      const bool useCompressedFilter = [&] {
+        if constexpr (std::is_same_v<
+                          typename V::FilterType,
+                          velox::common::NegatedBytesRange>) {
+          // Decode != predicates because comparing every symbol in a long value
+          // can be slower than decoding it once.
+          return !visitor.filter().getNonNegated()->isSingleValue();
+        } else {
+          return true;
+        }
+      }();
+      if (visitor.filter().isDeterministic() && useCompressedFilter) {
         detail::readWithVisitorSlow(
             visitor,
             params,
             skip,
             readCompressed,
             [&](std::string_view compressed, bool& atEnd) {
-              if (testCompressedRange(compressed, visitor.filter())) {
+              const bool passesFilter = [&] {
+                if constexpr (std::is_same_v<
+                                  typename V::FilterType,
+                                  velox::common::NegatedBytesRange>) {
+                  return !testCompressedRange(
+                      compressed, *visitor.filter().getNonNegated());
+                } else {
+                  return testCompressedRange(compressed, visitor.filter());
+                }
+              }();
+              if (passesFilter) {
                 visitor.filterPassed(std::string_view{});
               } else {
                 visitor.filterFailed();
